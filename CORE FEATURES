@@ -1,0 +1,9 @@
+ Bootloader Core Features
+
+1,UART/USB communication (to receive new firmware).
+
+2,CRC check (verify integrity of firmware).
+
+3,Flash erase + write (store firmware in MCU Flash).
+
+4,Jump to main application (after update or if no update).
