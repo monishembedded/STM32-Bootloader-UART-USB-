@@ -1,27 +1,340 @@
-
-#include "stm32f1xx_hal.h"
-#include "bootloader.h"
-
-UART_HandleTypeDef huart1;
-
-int main(void)
-{
-    HAL_Init();
-    SystemClock_Config();
-    MX_USART1_UART_Init();
-
-    // Small delay to check if update request comes
-    uint8_t update_cmd = 0;
-    HAL_UART_Receive(&huart1, &update_cmd, 1, 2000);
-
-    if (update_cmd == 0x55) // Example update command
-    {
-        Bootloader_UART_Download(&huart1);
-    }
-    else
-    {
-        Bootloader_JumpToApplication();
-    }
-
-    while (1);
-}
+	/* main.c - STM32F103C8T6 UART Bootloader (HAL)
+	   Bootloader functionality:
+	   - Waits briefly for 0x55 (enter update mode)
+	   - If update mode: receives header (uint32_t size, uint32_t crc32)
+		 and then receives firmware in chunks and writes to flash.
+	   - Verifies CRC and jumps to application if OK.
+	   - If not updating, jumps directly to application.
+	*/
+	
+	#include "stm32f1xx_hal.h"
+	#include <string.h>
+	#include <stdint.h>
+	
+	/* ---------- Config ---------- */
+	#define APP_ADDRESS       0x08004000U   // Application start address
+	#define BOOTLOADER_TIMEOUT_MS 1000      // Wait for command time
+	#define BL_CMD_ENTER      0x55U         // Command byte to enter bootloader
+	#define FLASH_PAGE_SIZE   1024U         // 1 KB per page (STM32F103 medium density)
+	#define PACKET_SIZE       256U          // Receive chunk size
+	/* ---------------------------- */
+	
+	UART_HandleTypeDef huart1;
+	
+	/* ---- function prototypes ---- */
+	void SystemClock_Config(void);
+	static void MX_GPIO_Init(void);
+	static void MX_USART1_UART_Init(void);
+	
+	typedef void (*pFunction)(void);
+	static uint32_t Calculate_CRC32(const uint8_t *data, uint32_t len);
+	static HAL_StatusTypeDef Flash_EraseApplicationArea(uint32_t app_addr, uint32_t size);
+	static HAL_StatusTypeDef Flash_WriteBuffer(uint32_t destAddr, const uint8_t *src, uint32_t length);
+	
+	static void Jump_To_Application(void);
+	static void Bootloader_FirmwareUpdate(void);
+	
+	/* Simple CRC32 (polynomial 0xEDB88320) */
+	static uint32_t crc32_table[256];
+	static void crc32_init(void)
+	{
+	  uint32_t poly = 0xEDB88320U;
+	  for (uint32_t i = 0; i < 256; i++) {
+		uint32_t crc = i;
+		for (uint32_t j = 0; j < 8; j++) {
+		  if (crc & 1) crc = (crc >> 1) ^ poly;
+		  else crc >>= 1;
+		}
+		crc32_table[i] = crc;
+	  }
+	}
+	static uint32_t Calculate_CRC32(const uint8_t *data, uint32_t len)
+	{
+	  uint32_t crc = 0xFFFFFFFFU;
+	  for (uint32_t i = 0; i < len; i++) {
+		uint8_t idx = (uint8_t)((crc ^ data[i]) & 0xFFU);
+		crc = (crc >> 8) ^ crc32_table[idx];
+	  }
+	  return ~crc;
+	}
+	
+	/* ---------- main ---------- */
+	int main(void)
+	{
+	  HAL_Init();
+	  SystemClock_Config();
+	  MX_GPIO_Init();
+	  MX_USART1_UART_Init();
+	  crc32_init();
+	
+	  uint8_t cmd = 0;
+	  // quick check: wait for BL_CMD_ENTER for a short time
+	  if (HAL_UART_Receive(&huart1, &cmd, 1, BOOTLOADER_TIMEOUT_MS) == HAL_OK && cmd == BL_CMD_ENTER) {
+		uint8_t msg[] = "Bootloader: Entering update mode\r\n";
+		HAL_UART_Transmit(&huart1, msg, sizeof(msg)-1, HAL_MAX_DELAY);
+		Bootloader_FirmwareUpdate();
+	  } else {
+		// no command -> jump to application
+		Jump_To_Application();
+	  }
+	
+	  while (1) { __NOP(); }
+	}
+	
+	/* ---------- Bootloader update flow ---------- */
+	/*
+	 Protocol (simple):
+	 1) Host sends 1 byte 0x55 (we already checked)
+	 2) Host sends header: uint32_t firmware_size (little-endian), uint32_t firmware_crc32
+	 3) Bootloader acknowledges with 1 byte 0xA5
+	 4) Host sends firmware content in chunks (up to PACKET_SIZE). Bootloader writes sequentially.
+	 5) After all bytes received, bootloader computes CRC and compares. If OK send 0xCC else 0xEE.
+	*/
+	
+	static void Bootloader_FirmwareUpdate(void)
+	{
+	  uint8_t ack;
+	  uint32_t fw_size = 0;
+	  uint32_t fw_crc  = 0;
+	
+	  // Step 1: receive header (8 bytes)
+	  uint8_t hdr[8];
+	  if (HAL_UART_Receive(&huart1, hdr, 8, HAL_MAX_DELAY) != HAL_OK) {
+		uint8_t err[] = "Bootloader: Header receive error\r\n";
+		HAL_UART_Transmit(&huart1, err, sizeof(err)-1, HAL_MAX_DELAY);
+		return;
+	  }
+	  fw_size = (uint32_t)hdr[0] | ((uint32_t)hdr[1]<<8) | ((uint32_t)hdr[2]<<16) | ((uint32_t)hdr[3]<<24);
+	  fw_crc  = (uint32_t)hdr[4] | ((uint32_t)hdr[5]<<8) | ((uint32_t)hdr[6]<<16) | ((uint32_t)hdr[7]<<24);
+	
+	  // Basic sanity
+	  if (fw_size == 0 || fw_size > (0x08020000 - APP_ADDRESS)) {
+		uint8_t err[] = "Bootloader: Invalid firmware size\r\n";
+		HAL_UART_Transmit(&huart1, err, sizeof(err)-1, HAL_MAX_DELAY);
+		return;
+	  }
+	
+	  // Ack header
+	  ack = 0xA5;
+	  HAL_UART_Transmit(&huart1, &ack, 1, HAL_MAX_DELAY);
+	
+	  // Erase area
+	  if (Flash_EraseApplicationArea(APP_ADDRESS, fw_size) != HAL_OK) {
+		uint8_t err[] = "Bootloader: Flash erase failed\r\n";
+		HAL_UART_Transmit(&huart1, err, sizeof(err)-1, HAL_MAX_DELAY);
+		return;
+	  }
+	
+	  // Receive and write firmware
+	  uint8_t rxbuf[PACKET_SIZE];
+	  uint32_t bytes_received = 0;
+	  uint32_t write_address = APP_ADDRESS;
+	  while (bytes_received < fw_size) {
+		uint32_t chunk = PACKET_SIZE;
+		if ((fw_size - bytes_received) < chunk) chunk = fw_size - bytes_received;
+	
+		if (HAL_UART_Receive(&huart1, rxbuf, chunk, HAL_MAX_DELAY) != HAL_OK) {
+		  uint8_t err[] = "Bootloader: Data receive error\r\n";
+		  HAL_UART_Transmit(&huart1, err, sizeof(err)-1, HAL_MAX_DELAY);
+		  return;
+		}
+	
+		// Program flash
+		if (Flash_WriteBuffer(write_address, rxbuf, chunk) != HAL_OK) {
+		  uint8_t err[] = "Bootloader: Flash write error\r\n";
+		  HAL_UART_Transmit(&huart1, err, sizeof(err)-1, HAL_MAX_DELAY);
+		  return;
+		}
+	
+		write_address += chunk;
+		bytes_received += chunk;
+		// optional progress ack
+		uint8_t progress = 0x5A;
+		HAL_UART_Transmit(&huart1, &progress, 1, 50);
+	  }
+	
+	  // Verify CRC on flash region
+	  // read back in chunks to compute CRC
+	  uint32_t calc_crc = 0xFFFFFFFFU;
+	  // compute using same function but by reading flash
+	  // We'll reuse Calculate_CRC32 by copying flash into buffer chunks
+	  uint32_t remain = fw_size;
+	  uint32_t addr = APP_ADDRESS;
+	  while (remain) {
+		uint32_t chunk = (remain > PACKET_SIZE) ? PACKET_SIZE : remain;
+		uint8_t tmp[PACKET_SIZE];
+		for (uint32_t i = 0; i < chunk; i++) {
+		  tmp[i] = *((uint8_t*)(addr + i));
+		}
+		// incremental CRC - we can call Calculate_CRC32 on each chunk while maintaining state:
+		// But Calculate_CRC32 computes from scratch. So accumulate manually:
+		// Simpler: collect entire firmware in RAM if size small — but could be big.
+		// So we'll do an incremental implementation here:
+		// We'll reuse crc32_table
+		for (uint32_t i = 0; i < chunk; i++) {
+		  uint8_t idx = (uint8_t)((calc_crc ^ tmp[i]) & 0xFFU);
+		  calc_crc = (calc_crc >> 8) ^ crc32_table[idx];
+		}
+		addr += chunk;
+		remain -= chunk;
+	  }
+	  calc_crc = ~calc_crc;
+	
+	  if (calc_crc == fw_crc) {
+		uint8_t ok = 0xCC;
+		HAL_UART_Transmit(&huart1, &ok, 1, HAL_MAX_DELAY);
+		// optional short delay and jump
+		HAL_Delay(50);
+		Jump_To_Application();
+	  } else {
+		uint8_t fail = 0xEE;
+		HAL_UART_Transmit(&huart1, &fail, 1, HAL_MAX_DELAY);
+		// stay in bootloader or reset
+	  }
+	}
+	
+	/* ---------- Flash helpers ---------- */
+	
+	/* Erase application area (page-by-page). Uses HAL flash erase API. */
+	static HAL_StatusTypeDef Flash_EraseApplicationArea(uint32_t app_addr, uint32_t size)
+	{
+	  HAL_StatusTypeDef status = HAL_OK;
+	  // Unlock flash
+	  HAL_FLASH_Unlock();
+	
+	  // For STM32F1 using HAL_FLASHEx_Erase - set up struct
+	  FLASH_EraseInitTypeDef EraseInit;
+	  uint32_t pageError = 0;
+	
+	  uint32_t firstPage = (app_addr - FLASH_BASE) / FLASH_PAGE_SIZE;
+	  uint32_t nbPages = (size + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE;
+	
+	  EraseInit.TypeErase = FLASH_TYPEERASE_PAGES;
+	  EraseInit.PageAddress = app_addr;
+	  EraseInit.NbPages = nbPages;
+	
+	  if (HAL_FLASHEx_Erase(&EraseInit, &pageError) != HAL_OK) {
+		status = HAL_ERROR;
+	  }
+	
+	  HAL_FLASH_Lock();
+	  return status;
+	}
+	
+	/* Write buffer to flash - programs half-words (16-bit) as required by F1 HAL */
+	static HAL_StatusTypeDef Flash_WriteBuffer(uint32_t destAddr, const uint8_t *src, uint32_t length)
+	{
+	  HAL_StatusTypeDef status = HAL_OK;
+	  HAL_FLASH_Unlock();
+	
+	  // keep alignment: program half-words
+	  uint32_t i = 0;
+	  // if destAddr is odd or we have odd length, handle carefully - we assume addresses are even and lengths can be any
+	  while (i < length) {
+		uint16_t halfword = 0xFFFF;
+		// low byte
+		halfword = src[i];
+		i++;
+		// high byte if present
+		if (i < length) {
+		  halfword |= ((uint16_t)src[i] << 8);
+		  i++;
+		} else {
+		  // if odd, high byte remains 0xFF
+		  halfword |= ((uint16_t)0xFF << 8);
+		}
+	
+		if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, destAddr, halfword) != HAL_OK) {
+		  status = HAL_ERROR;
+		  break;
+		}
+		destAddr += 2;
+	  }
+	
+	  HAL_FLASH_Lock();
+	  return status;
+	}
+	
+	/* ---------- Jump to application ---------- */
+	static void Jump_To_Application(void)
+	{
+	  // Check if stack at APP_ADDRESS seems valid (just basic check)
+	  uint32_t appStack = *(__IO uint32_t*)APP_ADDRESS;
+	  if ((appStack & 0x2FFE0000U) == 0x20000000U) { // SRAM address range
+		uint32_t resetHandler = *(__IO uint32_t*)(APP_ADDRESS + 4);
+		pFunction appEntry = (pFunction)resetHandler;
+	
+		__disable_irq();
+		// set MSP to application's stack pointer
+		__set_MSP(appStack);
+		// optional: set vector table offset
+	#if defined (SCB) && defined (SCB_VTOR)
+		SCB->VTOR = APP_ADDRESS;
+	#endif
+		__enable_irq();
+	
+		appEntry();
+	  } else {
+		// No valid app - stay in bootloader (or blink LED)
+		uint8_t err[] = "Bootloader: No valid application\r\n";
+		HAL_UART_Transmit(&huart1, err, sizeof(err)-1, HAL_MAX_DELAY);
+		while (1) { HAL_Delay(500); }
+	  }
+	}
+	
+	/* ---------- Peripheral init (CubeMX-like) ---------- */
+	void SystemClock_Config(void)
+	{
+	  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+	  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+	
+	  /* Initializes the CPU, AHB and APB busses clocks */
+	  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+	  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+	  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+	  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+	  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+	  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+	  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+	  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+		while (1);
+	  }
+	  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+								  |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+	  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+	  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+	  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+	  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+	  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) {
+		while (1);
+	  }
+	}
+	
+	static void MX_USART1_UART_Init(void)
+	{
+	  huart1.Instance = USART1;
+	  huart1.Init.BaudRate = 115200;
+	  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+	  huart1.Init.StopBits = UART_STOPBITS_1;
+	  huart1.Init.Parity = UART_PARITY_NONE;
+	  huart1.Init.Mode = UART_MODE_TX_RX;
+	  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+	  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+	  if (HAL_UART_Init(&huart1) != HAL_OK) {
+		while (1);
+	  }
+	}
+	
+	static void MX_GPIO_Init(void)
+	{
+	  __HAL_RCC_GPIOC_CLK_ENABLE();
+	  __HAL_RCC_GPIOA_CLK_ENABLE();
+	  __HAL_RCC_USART1_CLK_ENABLE();
+	  // configure any required pins (LEDs, etc.)
+	  GPIO_InitTypeDef GPIO_InitStruct = {0};
+	  // Example: onboard LED on PC13 (for blue pill it's usually PC13)
+	  GPIO_InitStruct.Pin = GPIO_PIN_13;
+	  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+	  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+	}
