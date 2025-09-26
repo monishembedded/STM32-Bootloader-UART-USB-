@@ -1,0 +1,69 @@
+#Use this script to send firmware.bin to the bootloader over serial.
+
+# uploader.py
+# pip install pyserial
+import serial
+import sys
+import time
+import struct
+from zlib import crc32
+
+if len(sys.argv) < 3:
+    print("Usage: python uploader.py <COMPORT> <firmware.bin>")
+    sys.exit(1)
+
+port = sys.argv[1]
+fn = sys.argv[2]
+
+baud = 115200
+
+with open(fn, "rb") as f:
+    data = f.read()
+
+size = len(data)
+crc = crc32(data) & 0xFFFFFFFF
+
+print("Firmware size:", size, "CRC32: 0x%08X" % crc)
+
+ser = serial.Serial(port, baud, timeout=2)
+time.sleep(0.1)
+
+# send enter command
+ser.write(b'\x55')
+time.sleep(0.05)
+
+# send header: size (LE) + crc (LE)
+ser.write(struct.pack('<I', size))
+ser.write(struct.pack('<I', crc))
+
+# wait ack (0xA5)
+ack = ser.read(1)
+if ack != b'\xA5':
+    print("No ack from bootloader, got:", ack)
+    ser.close()
+    sys.exit(1)
+print("Bootloader ack received. Sending firmware...")
+
+# send data in chunks
+chunk = 256
+sent = 0
+while sent < size:
+    tosend = data[sent:sent+chunk]
+    ser.write(tosend)
+    # optional: wait tiny
+    time.sleep(0.01)
+    # read optional progress ack
+    _ = ser.read(1)
+    sent += len(tosend)
+    print("Sent %d/%d" % (sent, size), end='\r')
+
+print("\nAll data sent. Waiting result...")
+res = ser.read(1)
+if res == b'\xCC':
+    print("Upload success!")
+elif res == b'\xEE':
+    print("Upload failed (CRC mismatch)!")
+else:
+    print("Unknown response:", res)
+
+ser.close()
